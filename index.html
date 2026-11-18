@@ -153,6 +153,22 @@ const DRIFT_OK = 0.35;          // seconds of allowed drift before a hard seek
 const NUDGE    = 1.5;           // above this we hard-seek; below we use playback rate
 const TICK_MS  = 700;           // host broadcast interval
 
+
+/* ICE servers: STUN finds your public address; TURN relays when the
+   network (carrier NAT, strict firewall) refuses a direct link. */
+const ICE = { iceServers: [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:freestun.net:3478' },
+  { urls: 'turn:freestun.net:3478', username: 'free', credential: 'free' },
+  { urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject', credential: 'openrelayproject' }
+]};
+
 let mode = null;        // 'host' | 'guest'
 let peer = null;
 let conns = [];         // host: all guest connections
@@ -249,7 +265,7 @@ function startHost(){
   $('guard').style.display = 'none';   // host keeps YouTube's own controls
   $('ctl').style.display = 'flex';
 
-  peer = new Peer(PREFIX + roomCode, { debug:1 });
+  peer = new Peer(PREFIX + roomCode, { debug:1, config: ICE });
 
   peer.on('open', () => {
     setDot('on');
@@ -267,6 +283,7 @@ function startHost(){
         c.send({ t:'pong', t0:d.t0, hostNow: Date.now() });
       }
     });
+    if (c.open) send(c, stateObj());
     c.on('open', () => send(c, stateObj()));
     c.on('close', () => {
       conns = conns.filter(x => x !== c);
@@ -321,59 +338,116 @@ function startGuest(codeIn){
   showStage();
   $('role').textContent = 'Viewer';
   $('pCode').textContent = roomCode;
-  $('guard').style.display = 'block';   // block manual control — host rules
+  $('guard').style.display = 'block';   // block manual control -- host rules
   $('ctl').style.display = 'none';
   $('tapstart').style.display = 'flex';
 
-  peer = new Peer({ debug:1 });
+  peer = new Peer({ debug:1, config: ICE });
 
   peer.on('open', () => {
-    $('sConn').textContent = 'dialling host…';
+    $('sConn').textContent = 'dialling host...';
     hostConn = peer.connect(PREFIX + roomCode, { reliable:true });
-
-    hostConn.on('open', () => {
-      setDot('on');
-      $('sConn').textContent = 'connected to host';
-      log('Connected to room ' + roomCode, 'ok');
-      syncClock();
-      setInterval(syncClock, 5000);
-    });
-
-    hostConn.on('data', d => {
-      if (!d) return;
-      if (d.t === 'pong'){
-        const now = Date.now();
-        const rtt = now - d.t0;
-        if (rtt < bestRtt){
-          bestRtt = rtt;
-          clockOffset = d.hostNow - (d.t0 + now)/2;
-        }
-        $('sPing').textContent = Math.round(bestRtt) + ' ms';
-        return;
-      }
-      if (d.t === 'state'){ lastState = d; applyState(d); }
-    });
-
-    hostConn.on('close', () => {
-      setDot('off');
-      $('sConn').textContent = 'host disconnected';
-      log('Host closed the room', 'err');
-    });
-    hostConn.on('error', () => log('Connection error', 'err'));
+    wireGuestConn();
   });
 
   peer.on('error', e => {
     setDot('off');
     if (e.type === 'peer-unavailable'){
       $('sConn').textContent = 'no such room';
-      log('No room with code ' + roomCode + ' — check the code, and that the host tab is open', 'err');
+      log('No room with code ' + roomCode + ' -- check the code, and that the host tab is open', 'err');
     } else {
       log('Peer error: ' + e.type, 'err');
     }
   });
 
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
+
   setInterval(tickUI, 250);
 }
+
+/* All handlers for the connection to the host. Called again on every retry,
+   because a retry creates a brand new DataConnection object. */
+function wireGuestConn(){
+  if (!hostConn) return;
+
+  hostConn.on('open', () => {
+    setDot('on');
+    retries = 0;
+    $('sConn').textContent = 'connected to host';
+    log('Connected to room ' + roomCode, 'ok');
+    syncClock();
+    if (!window.__clockTimer) window.__clockTimer = setInterval(syncClock, 5000);
+  });
+
+  hostConn.on('data', d => {
+    if (!d) return;
+    if (d.t === 'pong'){
+      const now = Date.now();
+      const rtt = now - d.t0;
+      if (rtt < bestRtt){
+        bestRtt = rtt;
+        clockOffset = d.hostNow - (d.t0 + now)/2;
+      }
+      $('sPing').textContent = Math.round(bestRtt) + ' ms';
+      return;
+    }
+    if (d.t === 'state'){ lastState = d; applyState(d); }
+  });
+
+  hostConn.on('close', () => {
+    setDot('off');
+    $('sConn').textContent = 'disconnected';
+    log('Connection to host closed', 'err');
+    retryConnect();
+  });
+
+  hostConn.on('error', e => {
+    log('Connection error: ' + (e && e.type ? e.type : '?'), 'err');
+  });
+
+  /* The underlying ICE state is what actually fails -- show it plainly. */
+  setTimeout(() => {
+    try {
+      const pc = hostConn.peerConnection;
+      if (!pc) return;
+      pc.oniceconnectionstatechange = () => {
+        const st = pc.iceConnectionState;
+        if (!hostConn.open) $('sConn').textContent = 'network: ' + st;
+        if (st === 'failed'){
+          log('Direct link failed -- retrying via relay', 'err');
+          retryConnect();
+        }
+        if (st === 'connected' || st === 'completed'){
+          setDot('on');
+          $('sConn').textContent = 'connected to host';
+        }
+      };
+    } catch(e){}
+  }, 800);
+}
+
+let retries = 0;
+function retryConnect(){
+  if (mode !== 'guest' || retries >= 4) {
+    if (retries >= 4) log('Gave up after 4 tries — see the note below', 'err');
+    return;
+  }
+  retries++;
+  log('Reconnecting (try ' + retries + ')…');
+  try { if (hostConn) hostConn.close(); } catch(e){}
+  setTimeout(() => {
+    hostConn = peer.connect(PREFIX + roomCode, { reliable:true });
+    wireGuestConn();
+  }, 1200);
+}
+
+/* watchdog: if nothing opened within 12s, retry */
+setInterval(() => {
+  if (mode === 'guest' && hostConn && !hostConn.open && retries < 4){
+    log('No answer yet — retrying');
+    retryConnect();
+  }
+}, 12000);
 
 function syncClock(){
   if (hostConn && hostConn.open) hostConn.send({ t:'ping', t0: Date.now() });
