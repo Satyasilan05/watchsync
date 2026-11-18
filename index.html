@@ -62,6 +62,20 @@
   #tapstart .sm{font-size:13px;color:var(--dim);margin-bottom:18px}
   #tapstart button{max-width:240px}
 
+  /* audio-only mode: collapse the video, show a now-playing strip */
+  body.audio #frame{height:0;min-height:0;padding:0;overflow:hidden;aspect-ratio:auto}
+  #np{display:none;padding:18px 14px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#171c22,#12161b);align-items:center;gap:14px}
+  body.audio #np{display:flex}
+  #npart{width:52px;height:52px;border-radius:10px;flex:0 0 auto;
+    background:linear-gradient(135deg,var(--accent),#7a1f1a);
+    display:flex;align-items:center;justify-content:center;font-size:24px}
+  #npart.spin{animation:sp 4s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  #nptitle{font-weight:600;font-size:15px;line-height:1.3;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  #npsub{font-size:12px;color:var(--dim);margin-top:3px}
+
   #ctl{padding:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;
     border-bottom:1px solid var(--line)}
   #ctl input{margin:0;flex:1;min-width:170px}
@@ -110,6 +124,7 @@
     <span class="pill">Code <b id="pCode">----</b></span>
     <span class="pill" id="pPeers">0 connected</span>
     <span id="barspace"></span>
+    <button id="bAudio" class="ib">🎵 Audio only</button>
     <button id="bMute" class="ib">🔊 Sound on</button>
   </div>
 
@@ -120,6 +135,14 @@
       <div class="big">Tap to start watching</div>
       <div class="sm">Phones need one tap before video can play with sound.</div>
       <button id="bTap">Start</button>
+    </div>
+  </div>
+
+  <div id="np">
+    <div id="npart">♪</div>
+    <div>
+      <div id="nptitle">Nothing playing yet</div>
+      <div id="npsub">Audio only — video hidden, lowest quality</div>
     </div>
   </div>
 
@@ -149,9 +172,11 @@
    ========================================================================= */
 
 const PREFIX   = 'wsync-v1-';   // PeerJS id namespace (public broker is shared)
-const DRIFT_OK = 0.35;          // seconds of allowed drift before a hard seek
-const NUDGE    = 1.5;           // above this we hard-seek; below we use playback rate
-const TICK_MS  = 700;           // host broadcast interval
+const DEAD     = 0.50;   // inside this, leave the player completely alone
+const HARD     = 2.50;   // beyond this, a hard seek is the only way back
+const COOLDOWN = 3000;   // ms of silence after a seek, so it can settle
+const TICK_MS  = 1000;   // host broadcast interval
+const FIX_MS   = 1000;   // how often a viewer checks its own drift
 
 
 /* ICE servers: STUN finds your public address; TURN relays when the
@@ -180,6 +205,9 @@ let lastState = null;
 let started = false;    // guest has tapped
 let muted = false;
 let correcting = false;
+let lastSeekAt = 0;      // when we last forced a seek
+let rateNow    = 1;      // playback rate we believe is set
+let audioOnly  = false;  // hide video + force lowest quality
 
 /* ---------------- tiny helpers ---------------- */
 const $ = id => document.getElementById(id);
@@ -244,7 +272,13 @@ window.onYouTubeIframeAPIReady = function(){
 
 function cue(id, t, play){
   if (!ytReady){ pendingVideo = {id, t, play}; return; }
-  player.loadVideoById({ videoId:id, startSeconds: t||0 });
+  player.loadVideoById({
+    videoId: id,
+    startSeconds: t || 0,
+    suggestedQuality: audioOnly ? 'tiny' : 'default'
+  });
+  if (audioOnly) setTimeout(applyLowQuality, 800);
+  setTimeout(updateNowPlaying, 1200);
   if (!play) setTimeout(()=>{ try{ player.pauseVideo(); }catch(e){} }, 400);
 }
 
@@ -363,6 +397,7 @@ function startGuest(codeIn){
   peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
 
   setInterval(tickUI, 250);
+  setInterval(fixDrift, FIX_MS);
 }
 
 /* All handlers for the connection to the host. Called again on every retry,
@@ -462,44 +497,82 @@ function hostTimeNow(){
 }
 
 function applyState(s){
-  if (!ytReady || !started){ return; }
+  if (!ytReady || !started) return;
   let cur = {};
   try { cur = player.getVideoData() || {}; } catch(e){}
 
-  // 1. Different video? load it at the host's position.
+  /* 1. Host switched video -> load it at the host's position. */
   if (s.id && cur.video_id !== s.id){
-    log('Loading video the host started');
+    log('Loading the video the host started');
+    lastSeekAt = Date.now();
     cue(s.id, hostTimeNow() || s.time, s.playing);
     return;
   }
   if (!s.id) return;
 
-  const target = hostTimeNow();
-  let mine = 0, st = -1;
-  try { mine = player.getCurrentTime(); st = player.getPlayerState(); } catch(e){ return; }
+  let st = -1;
+  try { st = player.getPlayerState(); } catch(e){ return; }
 
-  // 2. Match play / pause.
+  /* 2. Mirror play / pause only. Drift is handled on its own timer. */
   if (s.playing && st !== YT.PlayerState.PLAYING && st !== YT.PlayerState.BUFFERING){
     try { player.playVideo(); } catch(e){}
   }
   if (!s.playing && st === YT.PlayerState.PLAYING){
-    try { player.pauseVideo(); player.seekTo(s.time, true); } catch(e){}
+    try {
+      player.pauseVideo();
+      player.seekTo(s.time, true);
+      lastSeekAt = Date.now();
+    } catch(e){}
+  }
+}
+
+/* --------- drift correction: its own slow, patient loop -------------
+   Runs once a second, never while the player is buffering, and never
+   within COOLDOWN of its own last seek. Without that cooldown the
+   player still reports its pre-seek position, so we would seek again
+   and again -- which is what made playback stutter.            */
+function fixDrift(){
+  if (mode !== 'guest' || !ytReady || !started || !lastState || !lastState.playing) return;
+  if (Date.now() - lastSeekAt < COOLDOWN) return;
+
+  let st = -1, mine = 0;
+  try {
+    st = player.getPlayerState();
+    mine = player.getCurrentTime();
+  } catch(e){ return; }
+
+  // Buffering or not playing? Nothing to correct -- wait it out.
+  if (st !== YT.PlayerState.PLAYING) return;
+
+  const target = hostTimeNow();
+  if (target == null) return;
+  const drift = mine - target;
+  const off   = Math.abs(drift);
+
+  if (off > HARD){
+    // Too far gone to ease back -- jump, then stay quiet for COOLDOWN.
+    try {
+      setRate(1);
+      player.seekTo(target + 0.25, true);   // +0.25s covers the seek itself
+      lastSeekAt = Date.now();
+    } catch(e){}
+    log('Re-synced (' + drift.toFixed(1) + 's off)');
     return;
   }
 
-  // 3. Correct drift.
-  const drift = mine - target;
-  if (Math.abs(drift) > NUDGE){
-    try { player.seekTo(target, true); player.setPlaybackRate(1); } catch(e){}
-    log('Re-synced (' + drift.toFixed(1) + 's off)');
-  } else if (Math.abs(drift) > DRIFT_OK){
-    // gentle: speed up or slow down slightly instead of a visible jump
-    try { player.setPlaybackRate(drift < 0 ? 1.05 : 0.95); } catch(e){}
+  if (off > DEAD){
+    // Ease back invisibly: a 3% rate change is inaudible, a seek is not.
+    setRate(drift < 0 ? 1.03 : 0.97);
     correcting = true;
-  } else if (correcting){
-    try { player.setPlaybackRate(1); } catch(e){}
-    correcting = false;
+    return;
   }
+
+  if (correcting){ setRate(1); correcting = false; }
+}
+
+function setRate(r){
+  if (Math.abs(rateNow - r) < 0.001) return;
+  try { player.setPlaybackRate(r); rateNow = r; } catch(e){}
 }
 
 /* ---------------- shared UI ---------------- */
@@ -512,7 +585,8 @@ function tickUI(){
     const h = hostTimeNow();
     $('sHost').textContent = fmt(h);
     $('sDrift').textContent = (h != null && mine != null)
-      ? ((mine - h) >= 0 ? '+' : '') + (mine - h).toFixed(2) + 's' : '—';
+      ? ((mine - h) >= 0 ? '+' : '') + (mine - h).toFixed(2) + 's'
+        + (correcting ? '  (easing)' : '') : '—';
   } else {
     $('sHost').textContent = 'you are the host';
     $('sDrift').textContent = '—';
@@ -523,6 +597,39 @@ function tickUI(){
 function showStage(){
   $('landing').style.display = 'none';
   $('stage').style.display = 'flex';
+}
+
+function applyLowQuality(){
+  if (!ytReady) return;
+  try {
+    // 'tiny' is 144p. Ask a few times -- YouTube sometimes overrides the first.
+    player.setPlaybackQuality('tiny');
+    setTimeout(() => { try{ player.setPlaybackQuality('tiny'); }catch(e){} }, 2500);
+  } catch(e){}
+}
+
+function updateNowPlaying(){
+  if (!ytReady) return;
+  try {
+    const d = player.getVideoData() || {};
+    if (d.title){
+      $('nptitle').textContent = d.title;
+      $('npsub').textContent = audioOnly
+        ? 'Audio only — video hidden, 144p stream'
+        : 'Playing';
+    }
+  } catch(e){}
+}
+
+function setAudioOnly(on){
+  audioOnly = on;
+  document.body.classList.toggle('audio', on);
+  $('bAudio').textContent = on ? '📺 Show video' : '🎵 Audio only';
+  $('npart').className = on ? 'spin' : '';
+  if (on) applyLowQuality();
+  else { try { player.setPlaybackQuality('default'); } catch(e){} }
+  updateNowPlaying();
+  try { localStorage.setItem('ws_audio', on ? '1' : '0'); } catch(e){}
 }
 
 /* ---------------- wiring ---------------- */
@@ -553,6 +660,8 @@ $('bTap').onclick = () => {
   log('Started — following the host', 'ok');
 };
 
+$('bAudio').onclick = () => setAudioOnly(!audioOnly);
+
 $('bMute').onclick = () => {
   muted = !muted;
   try { muted ? player.mute() : player.unMute(); } catch(e){}
@@ -563,7 +672,10 @@ $('bMute').onclick = () => {
 window.addEventListener('load', () => {
   const h = location.hash.replace('#','').toUpperCase();
   if (/^[A-Z]{4}$/.test(h)) { $('iCode').value = h; }
+  try { if (localStorage.getItem('ws_audio') === '1') setAudioOnly(true); } catch(e){}
 });
+
+setInterval(updateNowPlaying, 4000);
 </script>
 </body>
 </html>
